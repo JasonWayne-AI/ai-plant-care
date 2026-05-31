@@ -1,0 +1,188 @@
+import cv2
+import time
+import json
+import os
+import requests
+from google import genai
+from google.genai import types
+from gpiozero import OutputDevice
+
+# --- 1. CONFIGURATION ---
+API_KEY = "Api Key"
+client = genai.Client(api_key=API_KEY)
+
+# GPIO Setup
+PUMP_PIN = 26 
+# Note: If your relay stays ON and only turns OFF when watering, 
+# change active_high to True. Most Pi relays are Active Low (False).
+pump = OutputDevice(PUMP_PIN, active_high=False, initial_value=False)
+
+# Calibration: How many ml your pump moves per second
+ML_PER_SECOND = 15 
+
+# --- 2. HELPER FUNCTIONS ---
+
+def get_detailed_weather():
+    """Fetches location and 3-day forecast."""
+    try:
+        # Get Location
+        loc_res = requests.get('https://ipapi.co/json/', timeout=5).json()
+        city = loc_res.get('city', 'Local Area')
+        lat, lon = loc_res.get('latitude', 0), loc_res.get('longitude', 0)
+        
+        # Get Weather
+        weather_url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+                       "&current_weather=true&daily=temperature_2m_max,temperature_2m_min,"
+                       "precipitation_sum,windspeed_10m_max&timezone=auto&forecast_days=3")
+        w_res = requests.get(weather_url, timeout=5).json()
+        
+        daily = w_res['daily']
+        forecast_lines = []
+        for i in range(3):
+            forecast_lines.append(f"Day {i+1}: High {daily['temperature_2m_max'][i]}°C, "
+                                  f"Low {daily['temperature_2m_min'][i]}°C, "
+                                  f"Rain {daily['precipitation_sum'][i]}mm, "
+                                  f"Wind {daily['windspeed_10m_max'][i]}km/h")
+            
+        return {
+            "city": city, 
+            "temp": w_res['current_weather']['temperature'], 
+            "forecast": "\n".join(forecast_lines)
+        }
+    except Exception as e:
+        print(f"  [!] Weather Data Error: {e}")
+        return {"city": "Unknown", "temp": "N/A", "forecast": "Forecast unavailable."}
+
+def water_the_plant(ml_str):
+    """Calculates time and triggers GPIO 26."""
+    try:
+        # Extract number from string like '150ml'
+        ml = int(''.join(filter(str.isdigit, ml_str)))
+        if ml <= 0: return
+        
+        # Safety cap: Never pump more than 500ml at once
+        ml = min(ml, 500) 
+        seconds = ml / ML_PER_SECOND
+        
+        print(f"  [💧] ACTION: Pumping {ml}ml (~{seconds:.1f} seconds)...")
+        pump.on()
+        time.sleep(seconds)
+        pump.off()
+        print("  [💧] DONE: Valve/Pump closed.")
+    except Exception as e:
+        print(f"  [!] Watering System Error: {e}")
+
+def get_botanist_report(image_path, weather, environment):
+    """Sends everything to Gemini AI."""
+    with open(image_path, "rb") as f:
+        image_bytes = f.read()
+
+    prompt = f"""
+    ENVIRONMENT: The plant is {environment.upper()}.
+    LOCATION: {weather['city']}
+    WEATHER FORECAST:\n{weather['forecast']}
+
+    TASK:
+    1. Identify the plant/fruit.
+    2. Health Check (0-100%): Look for yellowing, brown spots, or pests.
+    3. Prescription: If health < 90%, suggest fertilizer or specific care.
+    4. Soil Status: Does it look dry, wet, or ideal?
+    5. Watering: Provide amount in 'ml'.
+    
+    If {environment} is OUTDOORS, warn about wind > 25km/h or frost < 5°C.
+
+    Return ONLY JSON:
+    {{
+      "name": "...",
+      "health_score": "...",
+      "health_summary": "...",
+      "prescription": "...",
+      "soil": "...",
+      "water_ml": "...",
+      "advice": "...",
+      "warnings": "..."
+    }}
+    """
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[prompt, types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg")]
+        )
+        raw_text = response.text.strip()
+        start, end = raw_text.find('{'), raw_text.rfind('}') + 1
+        return json.loads(raw_text[start:end])
+    except Exception as e:
+        print(f"  [!] AI Analysis Error: {e}")
+        return None
+
+# --- 3. MAIN PROGRAM ---
+
+def main():
+    print("\n" + "="*30)
+    print("  SMART BOTANIST SETUP")
+    print("="*30)
+    
+    env_input = ""
+    while env_input not in ['1', '2']:
+        env_input = input("Where is your plant?\n1. Indoors\n2. Outdoors\nSelection: ")
+    environment = "indoors" if env_input == '1' else "outdoors"
+
+    cam = cv2.VideoCapture(0)
+    # Important for Pi 5 / USB Camera Buffer
+    cam.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    print("\n" + "🌿 " * 10)
+    print(f"  SYSTEM ACTIVE ({environment.upper()})")
+    print("  Press ENTER to analyze. Type 'q' to quit.")
+    print("🌿 " * 10)
+
+    try:
+        while True:
+            cmd = input("\n[Ready] Press Enter: ").lower()
+            if cmd == 'q': break
+            
+            # Clear Camera Buffer (takes a fresh photo)
+            for _ in range(8): cam.read()
+            ret, frame = cam.read()
+            if not ret:
+                print("  [!] Camera failed."); continue
+            
+            cv2.imwrite("capture.jpg", frame)
+            
+            print("  [+] Fetching weather...")
+            weather = get_detailed_weather()
+            
+            print(f"  [+] Analyzing {environment} environment...")
+            data = get_botanist_report("capture.jpg", weather, environment)
+
+            if data:
+                print(f"\n--- 📋 REPORT: {data.get('name').upper()} ---")
+                print(f"❤️  HEALTH: {data.get('health_score')} | {data.get('health_summary')}")
+                print(f"🧪 PRESCRIPTION: {data.get('prescription')}")
+                print(f"🪴 SOIL: {data.get('soil')}")
+                print(f"💧 WATER SUGGESTED: {data.get('water_ml')}")
+                
+                # Check for water command
+                water_amt = data.get('water_ml', '0ml')
+                if any(c.isdigit() for c in water_amt) and "0ml" not in water_amt:
+                    water_the_plant(water_amt)
+                else:
+                    print("  [-] No watering triggered.")
+
+                print(f"🌤️  ADVICE: {data.get('advice')}")
+                if data.get('warnings'):
+                    print(f"⚠️  WARNINGS: {data.get('warnings')}")
+                print("-" * 40)
+            else:
+                print("  [!] No response from AI.")
+
+    except KeyboardInterrupt:
+        print("\n  [!] User stopped script.")
+    finally:
+        pump.off() # Emergency safety shutoff
+        cam.release()
+        print("  [!] System offline.")
+
+if __name__ == "__main__":
+    main()
+
